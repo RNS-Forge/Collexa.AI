@@ -57,7 +57,7 @@ if GEMINI_API_KEY:
     try:
         # Configure Gemini
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel('gemini-pro')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         embeddings = GooglePalmEmbeddings(google_api_key=GEMINI_API_KEY)
         
         # Configure text splitting
@@ -779,6 +779,204 @@ def search_content():
         
     except Exception as e:
         return handle_error(f"Failed to search content: {str(e)}")
+
+# Chatbot endpoints for "other" collection
+@app.route('/api/chatbot/upload', methods=['POST'])
+def upload_chatbot_file():
+    """Upload files to the chatbot collection for RAG"""
+    try:
+        if 'file' not in request.files:
+            return handle_error("No file provided", 400)
+        
+        file = request.files['file']
+        if file.filename == '':
+            return handle_error("No file selected", 400)
+        
+        filename = secure_filename(file.filename)
+        if not allowed_file(filename):
+            return handle_error("File type not allowed. Only PDF, DOCX, DOC, and TXT files are supported", 400)
+        
+        # Check file size
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        if file_size > MAX_FILE_SIZE:
+            return handle_error(f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB", 400)
+        file.seek(0)
+        
+        # Extract text from the file
+        text_content = extract_file_text(file, filename)
+        
+        # Get file hash for deduplication
+        file.seek(0)
+        file_content = file.read()
+        file_hash = get_file_hash(file_content)
+        
+        # Check if file already exists
+        chatbot_collection = db.chatbot_files
+        existing_file = chatbot_collection.find_one({"file_hash": file_hash})
+        if existing_file:
+            return handle_error("File already exists", 409)
+        
+        # Create document object
+        document = {
+            "filename": filename,
+            "content": text_content,
+            "file_size": file_size,
+            "file_hash": file_hash,
+            "uploaded_at": datetime.utcnow(),
+            "content_preview": text_content[:200] + "..." if len(text_content) > 200 else text_content
+        }
+        
+        result = chatbot_collection.insert_one(document)
+        document['_id'] = str(result.inserted_id)
+        
+        logger.info(f"Uploaded chatbot file: {filename}")
+        return jsonify({
+            "message": "File uploaded successfully",
+            "file": document
+        }), 201
+        
+    except Exception as e:
+        return handle_error(f"Failed to upload file: {str(e)}")
+
+@app.route('/api/chatbot/files', methods=['GET'])
+def get_chatbot_files():
+    """Get all uploaded chatbot files"""
+    try:
+        chatbot_collection = db.chatbot_files
+        files = list(chatbot_collection.find().sort("uploaded_at", -1))
+        
+        for file in files:
+            file['_id'] = str(file['_id'])
+            # Remove full content for list view
+            file.pop('content', None)
+        
+        return jsonify({
+            "files": files,
+            "total": len(files)
+        }), 200
+        
+    except Exception as e:
+        return handle_error(f"Failed to get files: {str(e)}")
+
+@app.route('/api/chatbot/files/<file_id>', methods=['DELETE'])
+def delete_chatbot_file(file_id):
+    """Delete a chatbot file"""
+    if not is_valid_objectid(file_id):
+        return handle_error("Invalid file ID", 400)
+    
+    try:
+        chatbot_collection = db.chatbot_files
+        result = chatbot_collection.delete_one({"_id": ObjectId(file_id)})
+        
+        if result.deleted_count == 0:
+            return handle_error("File not found", 404)
+        
+        logger.info(f"Deleted chatbot file: {file_id}")
+        return jsonify({"message": "File deleted successfully"}), 200
+        
+    except Exception as e:
+        return handle_error(f"Failed to delete file: {str(e)}")
+
+def detect_video_links(text):
+    """Detect and extract video links from text"""
+    video_patterns = [
+        r'https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+',
+        r'https?://youtu\.be/[\w-]+',
+        r'https?://(?:www\.)?vimeo\.com/\d+',
+        r'https?://.*\.(?:mp4|avi|mov|wmv|flv|webm)'
+    ]
+    
+    links = []
+    for pattern in video_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        links.extend(matches)
+    
+    return links
+
+@app.route('/api/chatbot/chat', methods=['POST'])
+def chatbot_chat():
+    """Enhanced chatbot that uses both uploaded files (20%) and general AI knowledge (80%)"""
+    if not model:
+        return handle_error("AI service is not available", 503)
+    
+    try:
+        data = request.json
+        if not data:
+            return handle_error("No data provided", 400)
+        
+        query = data.get('query', '').strip()
+        if not query:
+            return handle_error("Query is required", 400)
+        
+        # Get uploaded files for context
+        chatbot_collection = db.chatbot_files
+        uploaded_files = list(chatbot_collection.find())
+        
+        context_from_files = ""
+        if uploaded_files and embeddings:
+            try:
+                # Process uploaded files for RAG
+                docs = []
+                for file_doc in uploaded_files:
+                    metadata = {
+                        'filename': file_doc.get('filename', 'Unknown'),
+                        'source': f"Uploaded file: {file_doc.get('filename', 'Unknown')}"
+                    }
+                    docs.extend(process_document_for_rag(file_doc.get('content', ''), metadata))
+                
+                if docs:
+                    # Create vector store and get relevant documents
+                    vectorstore = Chroma.from_documents(docs, embeddings)
+                    relevant_docs = vectorstore.similarity_search(query, k=3)
+                    
+                    context_from_files = "\n\n".join([
+                        f"From {doc.metadata.get('source', 'uploaded file')}:\n{doc.page_content}"
+                        for doc in relevant_docs
+                    ])
+            except Exception as e:
+                logger.warning(f"Failed to process uploaded files for context: {str(e)}")
+        
+        # Create enhanced prompt that balances general AI knowledge (80%) with uploaded context (20%)
+        if context_from_files:
+            prompt = f"""You are a helpful AI assistant. Answer the user's question using your general knowledge as the primary source (80% weight), while also considering relevant information from uploaded documents (20% weight) when applicable.
+
+Uploaded file context (use as supporting information only):
+{context_from_files}
+
+User question: {query}
+
+Provide a comprehensive answer that primarily draws from your general AI knowledge, but incorporate relevant details from the uploaded files when they add value to your response. If you include video links in your response, make sure they are properly formatted as clickable links."""
+        else:
+            prompt = f"""You are a helpful AI assistant. Answer the user's question using your general knowledge and expertise.
+
+User question: {query}
+
+Provide a comprehensive and helpful answer. If you include video links in your response, make sure they are properly formatted as clickable links."""
+        
+        # Generate response using Gemini
+        response = model.generate_content(prompt)
+        answer = response.text
+        
+        # Detect video links in the response
+        video_links = detect_video_links(answer)
+        
+        # Prepare sources
+        sources = []
+        if context_from_files:
+            sources = [doc.metadata.get('source') for doc in relevant_docs if doc.metadata.get('source')]
+        
+        return jsonify({
+            "answer": answer,
+            "sources": sources,
+            "video_links": video_links,
+            "has_file_context": bool(context_from_files),
+            "timestamp": datetime.utcnow().isoformat()
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Chatbot error: {str(e)}")
+        return handle_error(f"Failed to process chat request: {str(e)}")
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

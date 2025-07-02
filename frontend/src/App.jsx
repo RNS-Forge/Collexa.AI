@@ -6,7 +6,7 @@ import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
 import F1 from "./pages/f1";
 import HowItWorks from "./pages/HowItWorks";
 import About from "./pages/About";
-import Feature2 from "./pages/Feature2";
+import F2 from "./pages/f2";
 
 const App = () => {
   return (
@@ -15,7 +15,7 @@ const App = () => {
         {/* Home Landing */}
         <Route path="/" element={<F1 />} />
         <Route path="/collections" element={<F1 />} />
-        <Route path="/feature2" element={<Feature2 />} />
+        <Route path="/feature2" element={<F2 />} />
         <Route path="/how-it-works" element={<HowItWorks />} />
         <Route path="/about" element={<About />} />
       </Routes>
