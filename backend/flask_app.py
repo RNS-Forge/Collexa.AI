@@ -10,7 +10,7 @@ from langchain.prompts import ChatPromptTemplate
 from langchain.schema import Document as LangchainDocument
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import Chroma
-from langchain.embeddings import GooglePalmEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 from bson import ObjectId
 import io
@@ -21,6 +21,9 @@ import hashlib
 import json
 from typing import List, Dict, Any, Optional
 from werkzeug.utils import secure_filename
+
+# Disable Chroma telemetry
+os.environ['ANONYMIZED_TELEMETRY'] = 'False'
 
 app = Flask(__name__)
 CORS(app)
@@ -54,11 +57,10 @@ except Exception as e:
 
 # Initialize AI components
 if GEMINI_API_KEY:
-    try:
-        # Configure Gemini
+    try:        # Configure Gemini
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel('gemini-1.5-flash')
-        embeddings = GooglePalmEmbeddings(google_api_key=GEMINI_API_KEY)
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
         
         # Configure text splitting
         text_splitter = RecursiveCharacterTextSplitter(
@@ -896,7 +898,7 @@ def detect_video_links(text):
 
 @app.route('/api/chatbot/chat', methods=['POST'])
 def chatbot_chat():
-    """Enhanced chatbot that uses both uploaded files (20%) and general AI knowledge (80%)"""
+    """Enhanced RNS Reply chatbot that uses uploaded files (95%) and general AI knowledge (5%)"""
     if not model:
         return handle_error("AI service is not available", 503)
     
@@ -914,6 +916,7 @@ def chatbot_chat():
         uploaded_files = list(chatbot_collection.find())
         
         context_from_files = ""
+        relevant_docs = []
         if uploaded_files and embeddings:
             try:
                 # Process uploaded files for RAG
@@ -928,7 +931,7 @@ def chatbot_chat():
                 if docs:
                     # Create vector store and get relevant documents
                     vectorstore = Chroma.from_documents(docs, embeddings)
-                    relevant_docs = vectorstore.similarity_search(query, k=3)
+                    relevant_docs = vectorstore.similarity_search(query, k=5)  # Get more relevant docs
                     
                     context_from_files = "\n\n".join([
                         f"From {doc.metadata.get('source', 'uploaded file')}:\n{doc.page_content}"
@@ -936,23 +939,58 @@ def chatbot_chat():
                     ])
             except Exception as e:
                 logger.warning(f"Failed to process uploaded files for context: {str(e)}")
-        
-        # Create enhanced prompt that balances general AI knowledge (80%) with uploaded context (20%)
+          # Create enhanced prompt for RNS Reply with emphasis on uploaded files
         if context_from_files:
-            prompt = f"""You are a helpful AI assistant. Answer the user's question using your general knowledge as the primary source (80% weight), while also considering relevant information from uploaded documents (20% weight) when applicable.
+            prompt = f"""You are RNS Reply, an advanced AI assistant. Your primary goal is to answer questions using the uploaded documents as your main source of information.
 
-Uploaded file context (use as supporting information only):
+CRITICAL INSTRUCTIONS:
+1. **BASE YOUR ANSWER PRIMARILY ON THE UPLOADED FILES (95% of your response)**
+2. Use your general knowledge ONLY when the uploaded files don't contain relevant information (maximum 5%)
+3. If the uploaded files contain relevant information, prioritize that information heavily
+4. When the uploaded files don't have enough information, clearly state this and then provide minimal general knowledge
+5. Always cite which uploaded files you're referencing
+6. **ALWAYS suggest relevant YouTube videos** that complement your answer, even if files don't mention videos
+7. Format YouTube links properly for embedding (use format: https://www.youtube.com/watch?v=VIDEO_ID)
+
+**UPLOADED FILE CONTEXT (THIS IS YOUR PRIMARY SOURCE):**
 {context_from_files}
 
-User question: {query}
+**User Question:** {query}
 
-Provide a comprehensive answer that primarily draws from your general AI knowledge, but incorporate relevant details from the uploaded files when they add value to your response. If you include video links in your response, make sure they are properly formatted as clickable links."""
+**Your Response Must:**
+- Be based primarily on the uploaded file content above
+- Only use general knowledge to fill small gaps if the files don't contain relevant information
+- Clearly indicate when you're using information from uploaded files vs general knowledge
+- **ALWAYS include 2-3 relevant YouTube video links** that help explain or demonstrate the topic
+- Be well-structured and easy to read
+- Provide actionable insights
+
+**For YouTube videos:** Even if your uploaded files don't mention specific videos, suggest educational YouTube videos that would help someone learn about this topic. Use real YouTube links in this format: https://www.youtube.com/watch?v=VIDEO_ID
+
+Remember: You are RNS Reply, and your uploaded files are your primary knowledge source, but you should always enhance answers with helpful video resources."""
         else:
-            prompt = f"""You are a helpful AI assistant. Answer the user's question using your general knowledge and expertise.
+            prompt = f"""You are RNS Reply, an advanced AI assistant. Since no files have been uploaded or no relevant information is found in uploaded files, I'll provide a comprehensive response based on general knowledge.
 
-User question: {query}
+INSTRUCTIONS:
+1. Provide detailed, well-researched answers based on general knowledge
+2. Be conversational, friendly, and professional
+3. **ALWAYS suggest 2-3 relevant YouTube videos** that help explain or demonstrate the topic
+4. Format YouTube links properly for embedding (use format: https://www.youtube.com/watch?v=VIDEO_ID)
+5. Always aim to be practical and actionable in your advice
 
-Provide a comprehensive and helpful answer. If you include video links in your response, make sure they are properly formatted as clickable links."""
+**User Question:** {query}
+
+**Note:** No uploaded files contain relevant information for this question.
+
+Provide a comprehensive answer that:
+- Is well-researched and accurate based on general knowledge
+- **Includes 2-3 relevant YouTube video links** that help explain the topic (format: https://www.youtube.com/watch?v=VIDEO_ID)
+- Is well-structured and easy to read
+- Offers practical value to the user
+
+**For YouTube videos:** Suggest educational YouTube videos that would help someone learn about this topic. Use real YouTube links in this format: https://www.youtube.com/watch?v=VIDEO_ID
+
+Remember: You are RNS Reply, designed to be your helpful digital assistant with enhanced video recommendations."""
         
         # Generate response using Gemini
         response = model.generate_content(prompt)
@@ -971,11 +1009,12 @@ Provide a comprehensive and helpful answer. If you include video links in your r
             "sources": sources,
             "video_links": video_links,
             "has_file_context": bool(context_from_files),
+            "chatbot_name": "RNS Reply",
             "timestamp": datetime.utcnow().isoformat()
         }), 200
         
     except Exception as e:
-        logger.error(f"Chatbot error: {str(e)}")
+        logger.error(f"RNS Reply chatbot error: {str(e)}")
         return handle_error(f"Failed to process chat request: {str(e)}")
 
 if __name__ == '__main__':
